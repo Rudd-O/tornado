@@ -257,19 +257,21 @@ class ObjectHandler(BaseRequestHandler):
         part_number = self._get_part_number()
         upload_id = self._get_upload_id()
         if part_number and upload_id:
+            part_number = int(part_number)
             object_file = MultipartUploaderFactory(upload_id, None)
             if not object_file:
                 raise web.HTTPError(404, "No such upload ID %r" % upload_id)
-            object_file.write(int(part_number), self.request.body)
+            object_file.write(part_number, self.request.body)
+            self.set_header("ETag", object_file.buffers[part_number].md5sum)
         else:
             object_file = open(path, "w")
             object_file.write(self.request.body)
             object_file.close()
+            self.set_header("ETag", "ignored")
         # there is a bug in line 178 of s3/s3util/uploader.go
         # it chokes if no ETag is returned to it
         # p.ETag = s[1 : len(s)-1]
         # so I add this nonsense as a compromise
-        self.set_header("ETag", "ignored")
         self.finish()
 
     def _get_upload_id(self):
@@ -318,7 +320,7 @@ class ObjectHandler(BaseRequestHandler):
             self.set_status(200)
             complete_multipart_upload = "\n".join([
                 '''  <Part><PartNumber>%s</Bucket>
-  <ETag>ignored</ETag></Part>''' % (pn)
+  <ETag>%s</ETag></Part>''' % (pn, object_file.buffers[pn].md5sum)
                 for pn in range(1, object_file.part_number)
             ])
             xml = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -359,6 +361,13 @@ class ObjectHandler(BaseRequestHandler):
 multipart_uploaders = {}
 multipart_uploaders_lock = Lock()
 
+class _MultipartBuffer(object):
+    def __init__(self, data):
+        self.data = data
+        self.md5sum = hashlib.md5(data).hexdigest()
+
+    def forget_data(self):
+        self.data = None
 
 class _MultipartUploader(object):
 
@@ -379,17 +388,18 @@ class _MultipartUploader(object):
     def write(self, part_number, data):
         with self.lock:
             if part_number in self.buffers:
+                print "Buffer received:", len(data)
                 raise web.HTTPError(
                     400, "PartNumber %r already received" % part_number
                 )
-            self.buffers[part_number] = data
+            self.buffers[part_number] = _MultipartBuffer(data)
         self.trigger_write_completion()
 
     def trigger_write_completion(self):
         with self.lock:
             while self.part_number in self.buffers:
-                self.file.write(self.buffers[self.part_number])
-                del self.buffers[self.part_number]
+                self.file.write(self.buffers[self.part_number].data)
+                self.buffers[self.part_number].forget_data()
                 self.part_number = self.part_number + 1
 
     def close(self):
